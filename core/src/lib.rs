@@ -7,7 +7,7 @@
 //! paralellizable components (i.e. [SigVerify](sigverify/index.html)).  It also includes
 //! command-line tools to spin up validators and a Rust library
 //!
-
+pub mod unix_socket;
 pub mod accounts_hash_verifier;
 pub mod admin_rpc_post_init;
 pub mod banking_simulation;
