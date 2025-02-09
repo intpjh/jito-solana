@@ -7,7 +7,7 @@
 
 // 상단에 추가: 비동기 전송을 위한 모듈 및 tokio 관련 use 선언
 use tokio::runtime::Handle;
-use crate::net_utils::src::unix_socket;
+use crate::unix_socket;
 use base64::engine::general_purpose;
 use base64::Engine;
 use serde_json::json;
