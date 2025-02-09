@@ -4,19 +4,23 @@
 //! signature in that packet is valid. It assumes each packet contains one
 //! transaction. All processing is done on the CPU by default and on a GPU
 //! if perf-libs are available
+
 // 상단에 추가: 비동기 전송을 위한 모듈 및 tokio 관련 use 선언
 use tokio::runtime::Handle;
-use crate::unix_socket;
-use base64;
+use crate::net_utils::unix_socket;
+use base64::engine::general_purpose;
+use base64::Engine;
 use serde_json::json;
+
 // 새로운 헬퍼 함수: PacketBatch에서 discard되지 않은(유효한) 패킷의 트랜잭션 데이터를 Base64 문자열 리스트로 추출
 fn extract_valid_transactions(batches: &Vec<solana_perf::packet::PacketBatch>) -> Vec<String> {
     let mut txs = Vec::new();
     for batch in batches {
         for packet in batch {
             if !packet.meta().discard() {
-                // packet.data()로 패킷의 바이트 데이터를 가져온 후 Base64 인코딩
-                let tx_base64 = base64::encode(packet.data());
+                // packet.data()로 패킷의 바이트 데이터를 가져올 때, 전체 데이터를 슬라이스로 가져오기 위해 인덱스 범위 (..)를 전달
+                let data_slice = packet.data(..).expect("Packet data not available");
+                let tx_base64 = general_purpose::STANDARD.encode(data_slice);
                 txs.push(tx_base64);
             }
         }
