@@ -10,6 +10,7 @@ lto = "thin"
 
 [workspace]
 members = [
+    "serde_json",
     "account-decoder",
     "account-decoder-client-types",
     "accounts-bench",
@@ -264,7 +265,6 @@ check-cfg = [
 ]
 
 [workspace.dependencies]
-serde_json = "1.0"
 Inflector = "0.11.4"
 agave-transaction-view = { path = "transaction-view", version = "=2.2.0" }
 aquamarine = "0.3.3"
