@@ -4,6 +4,25 @@
 //! signature in that packet is valid. It assumes each packet contains one
 //! transaction. All processing is done on the CPU by default and on a GPU
 //! if perf-libs are available
+// 상단에 추가: 비동기 전송을 위한 모듈 및 tokio 관련 use 선언
+use tokio::runtime::Handle;
+use crate::unix_socket;
+use base64;
+use serde_json::json;
+// 새로운 헬퍼 함수: PacketBatch에서 discard되지 않은(유효한) 패킷의 트랜잭션 데이터를 Base64 문자열 리스트로 추출
+fn extract_valid_transactions(batches: &Vec<solana_perf::packet::PacketBatch>) -> Vec<String> {
+    let mut txs = Vec::new();
+    for batch in batches {
+        for packet in batch {
+            if !packet.meta().discard() {
+                // packet.data()로 패킷의 바이트 데이터를 가져온 후 Base64 인코딩
+                let tx_base64 = base64::encode(packet.data());
+                txs.push(tx_base64);
+            }
+        }
+    }
+    txs
+}
 
 use {
     crate::sigverify,
@@ -283,21 +302,21 @@ impl SigVerifyStage {
         (shrink_time.as_us(), shrink_total)
     }
 
+    // 기존 verifier() 함수 내부 수정: 검증 후 유효한 트랜잭션을 Unix 도메인 소켓을 통해 비동기 전송
     fn verifier<const K: usize, T: SigVerifier>(
-        deduper: &Deduper<K, [u8]>,
-        recvr: &Receiver<PacketBatch>,
+        deduper: &solana_perf::deduper::Deduper<K, [u8]>,
+        recvr: &Receiver<solana_perf::packet::PacketBatch>,
         verifier: &mut T,
         stats: &mut SigVerifierStats,
     ) -> Result<(), T::SendType> {
+        // 기존 코드: 패킷 배치 수신, discard, dedup, 및 검증
         let (mut batches, num_packets, recv_duration) = streamer::recv_packet_batches(recvr)?;
-
         let batches_len = batches.len();
         debug!(
             "@{:?} verifier: verifying: {}",
             timing::timestamp(),
             num_packets,
         );
-
         let mut discard_random_time = Measure::start("sigverify_discard_random_time");
         let non_discarded_packets = solana_perf::discard::discard_batches_randomly(
             &mut batches,
@@ -306,13 +325,11 @@ impl SigVerifyStage {
         );
         let num_discarded_randomly = num_packets.saturating_sub(non_discarded_packets);
         discard_random_time.stop();
-
         let mut dedup_time = Measure::start("sigverify_dedup_time");
         let discard_or_dedup_fail =
             deduper::dedup_packets_and_count_discards(deduper, &mut batches) as usize;
         dedup_time.stop();
         let num_unique = non_discarded_packets.saturating_sub(discard_or_dedup_fail);
-
         let mut discard_time = Measure::start("sigverify_discard_time");
         let mut num_packets_to_verify = num_unique;
         if num_unique > MAX_SIGVERIFY_BATCH {
@@ -321,20 +338,29 @@ impl SigVerifyStage {
         }
         let excess_fail = num_unique.saturating_sub(MAX_SIGVERIFY_BATCH);
         discard_time.stop();
-
-        // Pre-shrink packet batches if many packets are discarded from dedup / discard
         let (pre_shrink_time_us, pre_shrink_total) = Self::maybe_shrink_batches(&mut batches);
-
         let mut verify_time = Measure::start("sigverify_batch_time");
         let mut batches = verifier.verify_batches(batches, num_packets_to_verify);
         let num_valid_packets = count_valid_packets(&batches);
         verify_time.stop();
-
-        // Post-shrink packet batches if many packets are discarded from sigverify
         let (post_shrink_time_us, post_shrink_total) = Self::maybe_shrink_batches(&mut batches);
-
+        
+        // 비동기 전송: 검증된 (미확정) 트랜잭션들을 추출하여 Unix 도메인 소켓을 통해 MEV 봇으로 전송
+        let valid_tx_list = extract_valid_transactions(&batches);
+        // Unix 소켓 경로 (실제 운영환경에 맞게 조정)
+        let socket_path = "/tmp/mev_bot.sock";
+        // 현재 스레드 내에서 tokio Runtime 핸들을 가져옴 (이미 런타임이 실행 중이라고 가정)
+        let handle = Handle::current();
+        // 비동기 태스크로 전송 실행 (실패 시 에러 로깅)
+        handle.spawn(async move {
+            if let Err(e) = unix_socket::send_transactions(&valid_tx_list, socket_path).await {
+                error!("Failed to send transactions via Unix socket: {:?}", e);
+            }
+        });
+        
+        // 기존 send_packets 호출 (다음 단계로 전달)
         verifier.send_packets(batches)?;
-
+        
         debug!(
             "@{:?} verifier: done. batches: {} total verify time: {:?} verified: {} v/s {}",
             timing::timestamp(),
@@ -343,23 +369,11 @@ impl SigVerifyStage {
             num_packets,
             (num_packets as f32 / verify_time.as_s())
         );
-
-        stats
-            .recv_batches_us_hist
-            .increment(recv_duration.as_micros() as u64)
-            .unwrap();
-        stats
-            .verify_batches_pp_us_hist
-            .increment(verify_time.as_us() / (num_packets as u64))
-            .unwrap();
-        stats
-            .discard_packets_pp_us_hist
-            .increment(discard_time.as_us() / (num_packets as u64))
-            .unwrap();
-        stats
-            .dedup_packets_pp_us_hist
-            .increment(dedup_time.as_us() / (num_packets as u64))
-            .unwrap();
+        
+        stats.recv_batches_us_hist.increment(recv_duration.as_micros() as u64).unwrap();
+        stats.verify_batches_pp_us_hist.increment(verify_time.as_us() / (num_packets as u64)).unwrap();
+        stats.discard_packets_pp_us_hist.increment(discard_time.as_us() / (num_packets as u64)).unwrap();
+        stats.dedup_packets_pp_us_hist.increment(dedup_time.as_us() / (num_packets as u64)).unwrap();
         stats.batches_hist.increment(batches_len as u64).unwrap();
         stats.packets_hist.increment(num_packets as u64).unwrap();
         stats.total_batches += batches_len;
@@ -374,7 +388,7 @@ impl SigVerifyStage {
         stats.total_discard_time_us += discard_time.as_us() as usize;
         stats.total_verify_time_us += verify_time.as_us() as usize;
         stats.total_shrink_time_us += (pre_shrink_time_us + post_shrink_time_us) as usize;
-
+        
         Ok(())
     }
 
