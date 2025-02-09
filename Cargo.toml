@@ -10,7 +10,6 @@ lto = "thin"
 
 [workspace]
 members = [
-    "serde_json",
     "account-decoder",
     "account-decoder-client-types",
     "accounts-bench",
